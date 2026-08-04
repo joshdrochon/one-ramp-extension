@@ -1,7 +1,7 @@
 #one-ramp-panel {
   position: fixed;
-  right: 16px; /* default (list/home): the bottom-right corner */
-  bottom: 16px; /* fixed vertical band, so the move is purely sideways */
+  right: 16px; /* default (every page except detail): the bottom-right corner */
+  bottom: 16px; /* fixed vertical band, so the detail-page move is purely sideways */
   width: 320px;
   z-index: 2147483000;
   background: #fff;
@@ -13,8 +13,8 @@
   overflow: hidden;
 }
 #one-ramp-panel { transition: right 0.28s ease, opacity 0.25s ease; }
-/* Default is the corner (right 16). On expense detail pages, slide straight
-   left to right 58 (same bottom) so we clear Ramp's detail-page controls. */
+/* ONLY on expense detail pages, slide left (right 16 → 58, same bottom). Every
+   other page keeps the corner. */
 #one-ramp-panel.or-detail-pos { right: 58px; }
 #one-ramp-panel.or-hidden { opacity: 0; pointer-events: none; }
 #one-ramp-panel .or-chipbtn { display: none; border: none; background: none; padding: 0; cursor: pointer; }
