@@ -1,7 +1,7 @@
 #one-ramp-panel {
   position: fixed;
   right: 16px; /* default (every page except detail): the bottom-right corner */
-  bottom: 16px; /* fixed vertical band, so the detail-page move is purely sideways */
+  bottom: 14px; /* 36px chip centered on Ramp's 32px kebab (both centers 32px up) */
   width: 320px;
   z-index: 2147483000;
   background: #fff;
