@@ -1,7 +1,7 @@
 #one-ramp-panel {
   position: fixed;
-  right: 16px; /* aligned with Ramp's FAB (measured: 32px circle at 16/16) */
-  bottom: 58px; /* FAB bottom 16 + FAB height 32 + 10px gap */
+  right: 16px; /* default (list/home): the bottom-right corner */
+  bottom: 16px; /* fixed vertical band, so the move is purely sideways */
   width: 320px;
   z-index: 2147483000;
   background: #fff;
@@ -12,7 +12,10 @@
   color: #1f1e1b;
   overflow: hidden;
 }
-#one-ramp-panel { transition: opacity 0.25s ease; }
+#one-ramp-panel { transition: right 0.28s ease, opacity 0.25s ease; }
+/* Default is the corner (right 16). On expense detail pages, slide straight
+   left to right 58 (same bottom) so we clear Ramp's detail-page controls. */
+#one-ramp-panel.or-detail-pos { right: 58px; }
 #one-ramp-panel.or-hidden { opacity: 0; pointer-events: none; }
 #one-ramp-panel .or-chipbtn { display: none; border: none; background: none; padding: 0; cursor: pointer; }
 #one-ramp-panel .or-chipbtn img { width: 22px; height: 22px; border-radius: 6px; display: block; }

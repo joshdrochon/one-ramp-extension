@@ -66,9 +66,16 @@ function ensurePanel() {
 // Presence = relevance: a tiny chip when idle, the full panel when there's
 // work or an active flow, and auto-collapse shortly after a success.
 let collapseTimer = null;
+// On the expense detail page the panel slides left of Ramp's FAB (see ui.css);
+// everywhere else it stacks above it. Class toggle + CSS transition = the slide.
+const onDetailPage = () => /\/details\/my-expenses\//.test(location.pathname);
+function positionPanel() {
+  if (panel) panel.classList.toggle("or-detail-pos", onDetailPage());
+}
 function setMode(mode) {
   ensurePanel();
   panel.classList.toggle("or-chip", mode === "chip");
+  positionPanel(); // apply left/above placement immediately on any mode change
 }
 function collapseSoon(ms = 8000) {
   clearTimeout(collapseTimer);
@@ -565,6 +572,7 @@ function overlayIntersects() {
 }
 const fadeTick = setInterval(() => {
   if (!alive()) return clearInterval(fadeTick);
+  positionPanel(); // keep the left/above slide in sync with navigation
   if (panel && !busy) panel.classList.toggle("or-hidden", overlayIntersects());
 }, 300);
 
