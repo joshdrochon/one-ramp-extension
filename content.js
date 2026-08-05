@@ -356,11 +356,12 @@ function showMatchCard(state, match, confident, alternates) {
       <div><b>${confident ? "Match found" : "Possible match"}</b></div>
       <div class="or-big">${match.amtCents ? fmtCents(match.amtCents) + " · " : ""}${esc(state.merchant)} · ${esc(match.date)}</div>
       ${match.receiptNo ? `<div class="or-dim">Receipt #${esc(match.receiptNo)}</div>` : ""}
+      ${(match.viewUrl || match.file?.manualLink) ? `<div class="or-dim"><a href="${esc(match.viewUrl || match.file.manualLink)}" target="_blank" rel="noopener noreferrer">👁 View receipt ↗</a></div>` : ""}
       ${match.aiRationale ? `<div class="or-dim">🧠 ${esc(match.aiRationale.slice(0, 140))}${match.aiRationale.length > 140 ? "…" : ""}</div>` : ""}
       ${fileWarn}
       <label>Memo</label><input id="or-memo" value="${esc(match.memo)}"/>
       <button class="or-btn or-primary" id="or-attach">Attach ${needs.join(" + ") || "receipt + memo"}</button>
-      ${alternates?.length ? `<div class="or-dim" style="margin-top:6px">Not it? Pick the right one:</div>${alternates
+      ${alternates?.length ? `<div class="or-dim" style="margin-top:6px">Another charge this size? Pick the right receipt — open ↗ to check the time/amount first:</div>${alternates
         .map((a, j) => {
           // Every option should say what it IS: amount + time + receipt #
           // when we have them, otherwise fall back to the email's subject.
@@ -370,7 +371,8 @@ function showMatchCard(state, match, confident, alternates) {
                   .filter(Boolean)
                   .join(" · ")
               : `${esc(a.date)} · ${esc(a.subject.slice(0, 32))}`;
-          return `<button class="or-btn or-alt" data-j="${j}">${label}</button>`;
+          const view = a.viewUrl ? `<a class="or-view" href="${esc(a.viewUrl)}" target="_blank" rel="noopener noreferrer" title="View this receipt">👁</a>` : "";
+          return `<div class="or-altrow"><button class="or-btn or-alt" data-j="${j}">${label}</button>${view}</div>`;
         })
         .join("")}` : ""}
     </div>`);

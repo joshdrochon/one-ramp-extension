@@ -318,6 +318,10 @@ async function buildCandidates(refs, token, ctx) {
       }),
       receiptNo: (header(msg, "Subject").match(/#([\d-]+)/) || [])[1] || null,
       amtCents: amounts.includes(ctx.amountCents) ? ctx.amountCents : amounts[0] || 0,
+      // A Stripe-hosted receipt link the user can open to eyeball the receipt
+      // before attaching (mirrors the manual download-and-look step). Public
+      // link, no login needed.
+      viewUrl: ((parts.html || parts.text || "").match(RECEIPT_LINK_RE) || [])[0]?.replace(/&amp;/g, "&") || null,
       score: Math.round(score * 100) / 100,
       reasons,
       _msg: msg,
@@ -390,50 +394,87 @@ async function findReceipt({ merchant, amountCents, dateISO, dateHasTime }) {
     log("excluded", before - candidates.length, "already-attached receipt(s)");
 
   candidates.sort((a, b) => b.score - a.score);
-  let best = candidates[0];
-  if (!best)
+  if (!candidates.length)
     return {
       ok: false,
       error: `No receipt emails found for "${merchant}" near ${chargeDate.toDateString()}.`,
     };
 
-  // Two candidates within a hair of each other (e.g. same vendor + same
-  // amount on consecutive days) is ambiguity, not a match — never present
-  // it as confident, and give the judge a crack at it.
-  const second = candidates[1];
-  const ambiguous = !!second && best.score - second.score < 0.05;
-  if (ambiguous) log("ambiguous: top two scores", best.score, second.score);
+  // Time distance (ms) from a candidate receipt to the charge.
+  const chargeMs = +chargeDate;
+  const td = (c) => Math.abs(Number(c._msg.internalDate) - chargeMs);
+  const exact = candidates.filter((c) => c.amtCents === amountCents);
 
-  // Unsure → let the judge pick (or reject) among the top candidates.
-  let ai = null;
-  if ((best.score < 0.8 || ambiguous) && cfg) {
-    log("score below 0.8 — escalating to AI judge via", cfg.endpoint);
-    try {
-      const slim = candidates.slice(0, 5).map(slimFor);
-      const raw = await aiAssess(cfg, { charge, tried_query: q, candidates: slim });
-      ai = validVerdict(raw, slim.length);
-      if (!ai && raw) log("judge verdict FAILED validation:", raw);
-      if (ai && ai.match_index != null && candidates[ai.match_index]) {
-        best = candidates[ai.match_index];
-        best.aiRationale = ai.rationale;
-        best.aiConfidence = ai.confidence;
-      } else if (ai && ai.match_index == null) {
-        return {
-          ok: false,
-          error: `No confident match. AI judge: ${ai.rationale || "none of the candidates correspond to this charge."}`,
-        };
-      }
-    } catch (_) {}
+  let best, ambiguous = false, ai = null;
+
+  if (dateHasTime && exact.length) {
+    // Dominant real case: one or more SAME-AMOUNT receipts from the vendor. The
+    // right one is the receipt closest IN TIME to the charge — exactly how a
+    // human disambiguates two identical-price top-ups. The score's proximity
+    // term is day-scale and can't separate same-day twins, which is what matched
+    // a 5:52 charge to a 5:18 receipt instead of the 5:54 one.
+    exact.sort((a, b) => td(a) - td(b));
+    best = exact[0];
+    // Genuine twin: another same-amount receipt within 5 min of the winner's gap.
+    ambiguous = exact.length > 1 && td(exact[1]) - td(exact[0]) < 5 * 60 * 1000;
+    log("exact nearest-time pick:", best.subject, best.date, "gap(min):", Math.round(td(best) / 60000), "ambiguous:", ambiguous);
+  } else {
+    // No exact-amount receipt (possible tip / tax / currency case) or the charge
+    // time is unknown → fall back to score, and let the judge reason it out.
+    best = candidates[0];
+    const second = candidates[1];
+    ambiguous = !!second && best.score - second.score < 0.05;
+    if (cfg && (best.score < 0.8 || ambiguous)) {
+      log("no exact-amount match — escalating to AI judge via", cfg.endpoint);
+      try {
+        const slim = candidates.slice(0, 5).map(slimFor);
+        const raw = await aiAssess(cfg, { charge, tried_query: q, candidates: slim });
+        ai = validVerdict(raw, slim.length);
+        if (!ai && raw) log("judge verdict FAILED validation:", raw);
+        if (ai && ai.match_index != null && candidates[ai.match_index]) {
+          best = candidates[ai.match_index];
+          best.aiRationale = ai.rationale;
+          best.aiConfidence = ai.confidence;
+        } else if (ai && ai.match_index == null) {
+          return {
+            ok: false,
+            error: `No confident match. AI judge: ${ai.rationale || "none of the candidates correspond to this charge."}`,
+          };
+        }
+      } catch (_) {}
+    }
   }
 
   const file = await getReceiptFile(token, best._msg, best._html);
   const memo = (ai && ai.memo) || (vendorRule ? vendorRule.memo : `${merchant} purchase`);
   const strip = ({ _msg, _html, _amounts, ...rest }) => rest;
+
+  // Alternates = "not it? pick the right one." Same-amount receipts only for a
+  // known SaaS/Stripe vendor (a different amount is a different purchase); for an
+  // unknown vendor keep a couple different-amount fallbacks (tip/tax/FX). Sorted
+  // by time proximity so the closest twin is offered first.
+  const others = candidates.filter((c) => c !== best);
+  const sameAmt = others.filter((c) => c.amtCents === amountCents);
+  if (dateHasTime) sameAmt.sort((a, b) => td(a) - td(b));
+  const altPool = vendorRule
+    ? sameAmt
+    : [...sameAmt, ...others.filter((c) => c.amtCents !== amountCents)];
+
+  // Confident only when the nearest same-amount receipt is actually near the
+  // charge in time (≤15 min — receipts post within minutes) with no near-twin. A
+  // far-off nearest match (the real receipt may not have arrived yet) is shown as
+  // a "possible" match so the human checks rather than trusting it.
+  const closeInTime = dateHasTime && exact.length > 0 && td(best) <= 15 * 60 * 1000;
+  const confident =
+    (closeInTime && !ambiguous) ||
+    (!dateHasTime && best.score >= 0.8 && !ambiguous) ||
+    (best.aiConfidence || 0) >= 0.75;
+
   return {
     ok: true,
-    confident: (best.score >= 0.8 && !ambiguous) || (best.aiConfidence || 0) >= 0.75,
+    confident,
     match: { ...strip(best), file, memo },
-    alternates: candidates.filter((c) => c !== best).slice(0, 3).map(strip),
+    alternates: altPool.slice(0, 3).map(strip),
   };
 }
 

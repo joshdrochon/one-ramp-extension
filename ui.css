@@ -1,7 +1,7 @@
 #one-ramp-panel {
   position: fixed;
   right: 16px; /* default (every page except detail): the bottom-right corner */
-  bottom: 14px; /* 36px chip centered on Ramp's 32px kebab (both centers 32px up) */
+  bottom: 16px; /* fixed vertical band, so the detail-page move is purely sideways */
   width: 320px;
   z-index: 2147483000;
   background: #fff;
@@ -83,6 +83,10 @@
 }
 #one-ramp-panel .or-btn.or-primary:hover { background: #33322e; }
 #one-ramp-panel .or-alt { display: block; width: 100%; margin-top: 4px; font-weight: 500; font-size: 12px; text-align: left; }
+#one-ramp-panel .or-altrow { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+#one-ramp-panel .or-altrow .or-alt { margin-top: 0; flex: 1; }
+#one-ramp-panel .or-view { text-decoration: none; font-size: 15px; padding: 4px 6px; border: 1px solid #d8d5cc; border-radius: 7px; line-height: 1; }
+#one-ramp-panel .or-view:hover { background: #f6f4ee; }
 #one-ramp-panel .or-big { font-weight: 600; font-size: 14px; }
 #one-ramp-panel a { color: #1f5eff; }
 #one-ramp-panel .or-linkrow { margin-top: 8px; }
