@@ -370,7 +370,9 @@ function showMatchCard(state, match, confident, alternates) {
   // Keep the card in user language: amount, vendor, date and time. The
   // engineering detail (score, sender, reasons, file source) lives in the log.
   log("card:", match.subject, "| from", match.from, "| score", match.score, "| reasons", match.reasons, "| file", match.file?.source || match.file?.manualLink || "none");
-  const fileWarn = match.file?.dataB64
+  const fileWarn = match.file?.source === "generated"
+    ? `<div class="or-dim">🧾 No attachment in that email — built a PDF from it.</div>`
+    : match.file?.dataB64
     ? ""
     : match.file?.manualLink
     ? `<div class="or-dim">Couldn't auto-download the file. <a href="${esc(match.file.manualLink)}" target="_blank" rel="noopener noreferrer">Open the receipt</a>, save it, and drag it onto Ramp's upload box.</div>`
@@ -414,7 +416,7 @@ function showMatchCard(state, match, confident, alternates) {
   });
   $("#or-attach", body).onclick = async () => {
     busy = true;
-    let attached = false;
+    let didAttach = false, didWork = false;
     try {
       // Guard against writing to the wrong charge: if the user navigated to a
       // different expense while this card sat open, the visible page no longer
@@ -425,13 +427,19 @@ function showMatchCard(state, match, confident, alternates) {
         return;
       }
       const memoValue = $("#or-memo")?.value || match.memo;
+      // Nothing to do? (no receipt file in the email, and the memo is already set)
+      if ((state.hasReceipt || !match.file?.dataB64) && state.hasMemo) {
+        toast("Nothing to attach — no receipt file was in that email, and the memo is already set. Upload the receipt onto Ramp manually.", "or-warn");
+        return;
+      }
       toast("Attaching…");
-      if (!state.hasReceipt && match.file?.dataB64) await attachReceipt(match.file);
-      if (!state.hasMemo) await writeMemo(memoValue);
-      attached = true;
+      if (!state.hasReceipt && match.file?.dataB64) { await attachReceipt(match.file); didAttach = true; didWork = true; }
+      if (!state.hasMemo) { await writeMemo(memoValue); didWork = true; }
       try {
-        chrome.runtime.sendMessage({ type: "RECORD_ATTACHED", messageId: match.id });
-        chrome.runtime.sendMessage({ type: "BADGE_ADJUST", delta: -1 }); // one fewer outstanding
+        // Only mark the RECEIPT spent if it was actually attached — a no-file
+        // click must not exclude it from every future search (the retry-loop bug).
+        if (didAttach) chrome.runtime.sendMessage({ type: "RECORD_ATTACHED", messageId: match.id });
+        if (didWork) chrome.runtime.sendMessage({ type: "BADGE_ADJUST", delta: -1 }); // one fewer outstanding
       } catch (_) {}
     } catch (e) {
       toast(`Partial attach: ${esc(e.message)}`, "or-warn");
@@ -443,7 +451,7 @@ function showMatchCard(state, match, confident, alternates) {
       busy = false;
     }
     // Fire-and-forget: the watch only reads Ramp's status; it must not hold busy.
-    if (attached) watchVerification().catch((e) => log("verify watch:", String((e && e.message) || e)));
+    if (didWork) watchVerification().catch((e) => log("verify watch:", String((e && e.message) || e)));
   };
   // The card is now the resting state; release busy so a real page navigation
   // can refresh it. flowActive() still protects it via the #or-attach check,

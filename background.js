@@ -320,6 +320,77 @@ async function fetchAsPdfOrImage(url, depth = 0) {
 const RECEIPT_LINK_RE =
   /https:\/\/(?:pay|invoice)\.stripe\.com\/[^\s"'<>]+/g;
 
+// --- receipt PDF generation (no deps, no DOM: runs in the service worker) -----
+// Many receipts (Google Play, Apple, and plenty of SaaS) are inline-HTML emails
+// with no attachment and no hosted PDF — nothing to drop onto Ramp. Rather than
+// give up, we build a clean text PDF from the email's own content. Courier
+// (monospace) keeps wrapping predictable; text is sanitized to printable ASCII so
+// the resulting PDF is always valid.
+function pdfSanitize(s) {
+  return String(s || "")
+    .replace(/[‘’‛′]/g, "'")
+    .replace(/[“”″]/g, '"')
+    .replace(/[–—−]/g, "-")
+    .replace(/[•●·]/g, "-")
+    .replace(/[   ]/g, " ")
+    .replace(/\t/g, "  ")
+    .replace(/\r/g, "")
+    .replace(/[^\x20-\x7E\n]/g, ""); // drop remaining non-ASCII + control (keep \n)
+}
+function pdfWrap(text, width) {
+  const out = [];
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.replace(/\s+$/, "");
+    if (line.length <= width) { out.push(line); continue; }
+    let cur = "";
+    for (const tok of line.split(/(\s+)/)) {
+      if (!tok) continue;
+      if ((cur + tok).length <= width) { cur += tok; continue; }
+      if (cur.trim()) out.push(cur.replace(/\s+$/, ""));
+      let w = /^\s/.test(tok) ? "" : tok;
+      while (w.length > width) { out.push(w.slice(0, width)); w = w.slice(width); }
+      cur = w;
+    }
+    if (cur.trim()) out.push(cur.replace(/\s+$/, ""));
+  }
+  return out;
+}
+/** Build a minimal, valid single-font PDF from plain text. Returns base64. */
+function buildReceiptPdf(text) {
+  const COLS = 84, ROWS = 56, FS = 10, LEAD = 12, X = 54, TOP = 738;
+  let lines = pdfWrap(pdfSanitize(text), COLS);
+  if (!lines.length) lines = [""];
+  const pages = [];
+  for (let i = 0; i < lines.length; i += ROWS) pages.push(lines.slice(i, i + ROWS));
+  const esc = (s) => s.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+
+  const objs = {};
+  objs[1] = "<< /Type /Catalog /Pages 2 0 R >>";
+  const kids = pages.map((_, k) => `${4 + 2 * k} 0 R`);
+  objs[2] = `<< /Type /Pages /Kids [${kids.join(" ")}] /Count ${pages.length} >>`;
+  objs[3] = "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>";
+  pages.forEach((pg, k) => {
+    const pageNum = 4 + 2 * k, contentNum = 5 + 2 * k;
+    objs[pageNum] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentNum} 0 R >>`;
+    const body = pg.map((ln) => `(${esc(ln)}) Tj T*`).join("\n");
+    const stream = `BT /F1 ${FS} Tf ${LEAD} TL ${X} ${TOP} Td\n${body}\nET`;
+    objs[contentNum] = `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`;
+  });
+
+  const total = 3 + 2 * pages.length;
+  let pdf = "%PDF-1.4\n";
+  const offsets = [];
+  for (let n = 1; n <= total; n++) {
+    offsets[n] = pdf.length;
+    pdf += `${n} 0 obj\n${objs[n]}\nendobj\n`;
+  }
+  const xrefAt = pdf.length;
+  pdf += `xref\n0 ${total + 1}\n0000000000 65535 f \n`;
+  for (let n = 1; n <= total; n++) pdf += `${String(offsets[n]).padStart(10, "0")} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${total + 1} /Root 1 0 R >>\nstartxref\n${xrefAt}\n%%EOF`;
+  return btoa(pdf);
+}
+
 async function getReceiptFile(token, msg, bodyHtml) {
   const parts = walkParts(msg.payload, { text: "", html: "", attachments: [] });
   // 1) A real receipt attachment wins — but prefer PDFs, and skip tiny images
@@ -352,7 +423,29 @@ async function getReceiptFile(token, msg, bodyHtml) {
       return { filename: `receipt.${ext}`, ...file, source: "stripe-link" };
     }
   }
-  // 3) Nothing fetchable — hand the link back for a manual save.
+  // 3) No attachment and no hosted PDF: BUILD a PDF from the email's own content,
+  //    so an inline-HTML receipt (Google Play, Apple, many SaaS) still yields a
+  //    file to attach instead of leaving nothing to drop onto Ramp.
+  try {
+    const raw = (parts.text && parts.text.trim())
+      ? parts.text
+      : (parts.html || "").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ");
+    const clean = raw
+      .replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&#0?39;|&rsquo;/gi, "'")
+      .replace(/&quot;/gi, '"').replace(/&gt;/gi, ">").replace(/&lt;/gi, "<")
+      .replace(/[ \t]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim().slice(0, 6000);
+    const head = [
+      header(msg, "Subject") || "Receipt",
+      "From: " + header(msg, "From"),
+      "Date: " + new Date(Number(msg.internalDate)).toLocaleString(),
+      "-".repeat(60), "",
+    ].join("\n");
+    const dataB64 = buildReceiptPdf(head + "\n" + clean);
+    if (dataB64) return { filename: "receipt.pdf", mime: "application/pdf", dataB64, source: "generated" };
+  } catch (e) {
+    log("receipt PDF generation failed:", String(e.message || e));
+  }
+  // Last resort: hand back a hosted link (if any) for a manual save.
   return links.length ? { manualLink: links[0] } : null;
 }
 
