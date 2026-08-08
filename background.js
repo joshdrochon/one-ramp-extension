@@ -8,11 +8,14 @@
 const log = (...a) => console.log("[OneRamp]", ...a);
 
 // ---------------------------------------------------------------- vendors ---
-// Per-vendor search patterns and memo templates. Extend freely.
+// Per-vendor search patterns and memo templates. A vendor rule REPLACES the
+// generic search, so only add one when the receipt's real sender is known — a
+// wrong sender here means that vendor's receipt is never found. `memo` may be a
+// string, or a function of the cleaned merchant name.
 const VENDORS = [
   {
     match: /anthropic/i,
-    query: 'from:mail.anthropic.com',
+    query: "from:mail.anthropic.com",
     memo: "Claude subscription / API credits",
   },
   {
@@ -25,19 +28,150 @@ const VENDORS = [
     query: "from:railway.app OR from:railway.com",
     memo: "Railway hosting",
   },
+  {
+    // Google's CONSUMER subscriptions (Google One, AI Pro, YouTube Premium, Play
+    // apps, Gemini, extra storage) bill through Google Play, so the receipt comes
+    // from the Play sender — not a "Google One" address. Confirmed live:
+    // googleplay-noreply@google.com, subject "Your Google Play Order Receipt".
+    // Deliberately scoped to consumer products so it never hijacks Google
+    // Cloud / Ads / Workspace, which bill separately from different senders.
+    match: /google\s*(one|play|ai|storage|gemini)|youtube\s*premium|g\.co\/helppay/i,
+    query: "from:googleplay-noreply@google.com",
+    memo: (m) => `${m} subscription`,
+  },
+  {
+    // Apple App Store / iTunes bills show on the card as "APPLE.COM/BILL"; the
+    // receipt is from Apple (no_reply@email.apple.com), subject "Your receipt
+    // from Apple". That card descriptor never appears in the email, so search the
+    // sender, not the merchant string.
+    match: /apple\.com\/bill|itunes|app\s*store/i,
+    query: "from:apple.com",
+    memo: "Apple / App Store purchase",
+  },
+  {
+    // Figma bills from figma.com (support+notifications@figma.com). Confirmed live.
+    match: /figma/i,
+    query: "from:figma.com",
+    memo: "Figma subscription",
+  },
 ];
+
+// Card statements wrap the real vendor name in cruft — asterisks, help URLs,
+// phone/store numbers, "INC/LLC", commas — none of which appears in the receipt
+// email. Strip it so the merchant term actually matches:
+// "GOOGLE *Google One g.co/helppay# CA" → "GOOGLE Google One CA".
+function cleanMerchant(m) {
+  return String(m || "")
+    .replace(/\bg\.co\/\S+/gi, " ")
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/[*#,]+/g, " ")
+    .replace(/\b(inc|llc|ltd|corp|pbc)\b\.?/gi, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+// Resolve a vendor rule's memo (string or merchant-aware function).
+const memoFor = (rule, merchant) =>
+  rule
+    ? typeof rule.memo === "function"
+      ? rule.memo(cleanMerchant(merchant) || merchant)
+      : rule.memo
+    : null;
+
+// Generic fallback for vendors without a rule. Unquoted (a card descriptor rarely
+// appears verbatim in the receipt) and broadened with subscription/statement;
+// amount + time scoring filters any false positives the looser match admits.
 const GENERIC_QUERY = (merchant) =>
-  `"${merchant}" (receipt OR invoice OR order OR payment)`;
+  `${cleanMerchant(merchant) || merchant} (receipt OR invoice OR order OR payment OR subscription OR statement)`;
 
 // ------------------------------------------------------------------- auth ---
-function getToken(interactive) {
+// Auth runs on chrome.identity.launchWebAuthFlow (NOT getAuthToken). getAuthToken
+// is pinned to the Chrome profile's primary Google account, so it can't let a
+// user pick a different inbox — launchWebAuthFlow shows Google's account chooser
+// and works for any account. We use the implicit flow (response_type=token): no
+// client secret, so nothing secret ships in this public repo. The tradeoff is
+// these tokens don't auto-refresh, so we cache the access token + expiry and
+// silently re-mint via launchWebAuthFlow (interactive:false) when it lapses.
+const WEB_CLIENT_ID =
+  "607338298511-ia1oed8i2m28v1g9ensg73shlc9bs0ed.apps.googleusercontent.com";
+const GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+const TOKEN_SKEW_MS = 60 * 1000; // re-mint a minute early so no call rides a dying token
+
+/**
+ * Build the Google OAuth (implicit) URL. prompt:'select_account' forces the
+ * account chooser (explicit Connect/Switch); login_hint keeps a silent re-mint
+ * on the SAME account so background finds never change which inbox is connected.
+ */
+function authUrl({ prompt, loginHint } = {}) {
+  const p = new URLSearchParams({
+    client_id: WEB_CLIENT_ID,
+    response_type: "token",
+    redirect_uri: chrome.identity.getRedirectURL(),
+    scope: GMAIL_SCOPE,
+  });
+  if (prompt) p.set("prompt", prompt);
+  if (loginHint) p.set("login_hint", loginHint);
+  return `https://accounts.google.com/o/oauth2/v2/auth?${p}`;
+}
+
+/** Pull {token, expiresAt} out of the #access_token=…&expires_in=… redirect. */
+function parseTokenFromRedirect(redirectUrl) {
+  const frag = String(redirectUrl || "").split("#")[1] || "";
+  const params = new URLSearchParams(frag);
+  const token = params.get("access_token");
+  if (!token) throw new Error(params.get("error") || "no access_token in redirect");
+  const expiresIn = Number(params.get("expires_in") || 3600);
+  return { token, expiresAt: Date.now() + expiresIn * 1000 };
+}
+
+function launchAuth(interactive, opts = {}) {
   return new Promise((resolve, reject) => {
-    chrome.identity.getAuthToken({ interactive }, (token) => {
-      if (chrome.runtime.lastError || !token) {
-        reject(new Error(chrome.runtime.lastError?.message || "No token"));
-      } else resolve(token);
+    chrome.identity.launchWebAuthFlow({ url: authUrl(opts), interactive }, (redirectUrl) => {
+      if (chrome.runtime.lastError || !redirectUrl)
+        return reject(new Error(chrome.runtime.lastError?.message || "auth flow dismissed"));
+      try { resolve(parseTokenFromRedirect(redirectUrl)); }
+      catch (e) { reject(e); }
     });
   });
+}
+
+// --- token cache in chrome.storage.local (survives service-worker restarts) ---
+async function storedToken() {
+  const { gmailToken, gmailTokenExp } = await chrome.storage.local.get(["gmailToken", "gmailTokenExp"]);
+  if (gmailToken && gmailTokenExp && Date.now() < gmailTokenExp - TOKEN_SKEW_MS) return gmailToken;
+  return null;
+}
+async function saveToken(token, expiresAt, email) {
+  const patch = { gmailToken: token, gmailTokenExp: expiresAt };
+  if (email) patch.gmailEmail = email;
+  await chrome.storage.local.set(patch);
+}
+/** Full sign-out: drop the token AND the remembered account. */
+async function clearToken() {
+  await chrome.storage.local.remove(["gmailToken", "gmailTokenExp", "gmailEmail"]);
+}
+
+/**
+ * Return a usable access token. Order: fresh cached token → silent re-mint
+ * (Google session still alive) → interactive only when allowed. Interactive here
+ * re-auths the SAME account (login_hint, no picker); the account *chooser* is
+ * reserved for the explicit Connect/Switch action so a background find never
+ * hijacks which inbox is connected.
+ */
+async function getToken(interactive) {
+  const cached = await storedToken();
+  if (cached) return cached;
+  const { gmailEmail } = await chrome.storage.local.get("gmailEmail");
+  try {
+    const { token, expiresAt } = await launchAuth(false, { loginHint: gmailEmail });
+    await saveToken(token, expiresAt);
+    return token;
+  } catch (_) {
+    if (!interactive) throw new Error("AUTH_EXPIRED");
+  }
+  const { token, expiresAt } = await launchAuth(true, { loginHint: gmailEmail, prompt: "consent" });
+  await saveToken(token, expiresAt);
+  return token;
 }
 
 async function gmailFetch(path, token) {
@@ -45,10 +179,10 @@ async function gmailFetch(path, token) {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (res.status === 401) {
-    // Testing-mode grants expire ~weekly; Chrome keeps caching the dead token,
-    // so purge it here — otherwise getToken(false) keeps handing back the same
-    // 401'ing token and both Retry and Reconnect loop forever.
-    try { chrome.identity.removeCachedAuthToken({ token }); } catch (_) {}
+    // Token died mid-flight (revoked or lapsed). Drop the cached copy — but keep
+    // gmailEmail so the next getToken() can silently re-mint the SAME account —
+    // otherwise Retry keeps re-sending the dead token.
+    await chrome.storage.local.remove(["gmailToken", "gmailTokenExp"]);
     throw new Error("AUTH_EXPIRED");
   }
   if (!res.ok) throw new Error(`Gmail ${res.status} on ${path}`);
@@ -347,7 +481,10 @@ const slimFor = (c, i) => ({
 });
 
 async function findReceipt({ merchant, amountCents, dateISO, dateHasTime }) {
-  const token = await getToken(false).catch(() => getToken(true));
+  const token = await getToken(false);
+  // The connected inbox, handed back to the panel so a "no receipt found" reads
+  // as "not in THIS account" (Koby runs 2-3) rather than "the receipt's missing".
+  const { gmailEmail: account = null } = await chrome.storage.local.get("gmailEmail");
   const chargeDate = new Date(dateISO);
   const vendorRule = VENDORS.find((v) => v.match.test(merchant)) || null;
   const windowQ = `after:${gmailDate(new Date(chargeDate - 3 * dayMs))} before:${gmailDate(
@@ -397,6 +534,7 @@ async function findReceipt({ merchant, amountCents, dateISO, dateHasTime }) {
   if (!candidates.length)
     return {
       ok: false,
+      account,
       error: `No receipt emails found for "${merchant}" near ${chargeDate.toDateString()}.`,
     };
 
@@ -438,6 +576,7 @@ async function findReceipt({ merchant, amountCents, dateISO, dateHasTime }) {
         } else if (ai && ai.match_index == null) {
           return {
             ok: false,
+            account,
             error: `No confident match. AI judge: ${ai.rationale || "none of the candidates correspond to this charge."}`,
           };
         }
@@ -446,7 +585,7 @@ async function findReceipt({ merchant, amountCents, dateISO, dateHasTime }) {
   }
 
   const file = await getReceiptFile(token, best._msg, best._html);
-  const memo = (ai && ai.memo) || (vendorRule ? vendorRule.memo : `${merchant} purchase`);
+  const memo = (ai && ai.memo) || memoFor(vendorRule, merchant) || `${merchant} purchase`;
   const strip = ({ _msg, _html, _amounts, ...rest }) => rest;
 
   // Alternates = "not it? pick the right one." Same-amount receipts only for a
@@ -473,6 +612,7 @@ async function findReceipt({ merchant, amountCents, dateISO, dateHasTime }) {
   return {
     ok: true,
     confident,
+    account,
     match: { ...strip(best), file, memo },
     alternates: altPool.slice(0, 3).map(strip),
   };
@@ -484,20 +624,38 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
     try {
       if (req.type === "FIND_RECEIPT") sendResponse(await findReceipt(req));
       else if (req.type === "CONNECT_GMAIL") {
-        // Purge any stale cached token first so a revoked grant actually shows
-        // Google's consent screen instead of silently returning the dead token.
-        const stale = await getToken(false).catch(() => null);
-        if (stale) await new Promise((r) => chrome.identity.removeCachedAuthToken({ token: stale }, r));
-        const token = await getToken(true);
+        // Always show Google's account chooser (select_account) so the user picks
+        // WHICH inbox — the whole reason we use launchWebAuthFlow instead of
+        // getAuthToken (which is pinned to the Chrome profile's primary account).
+        const { token, expiresAt } = await launchAuth(true, { prompt: "select_account" });
         const profile = await gmailFetch("profile", token);
+        await saveToken(token, expiresAt, profile.emailAddress);
         sendResponse({ ok: true, email: profile.emailAddress });
+      } else if (req.type === "DISCONNECT_GMAIL") {
+        // Sign out: best-effort server-side revoke, then wipe the local identity
+        // so the next connect starts clean at the account picker.
+        const { gmailToken } = await chrome.storage.local.get("gmailToken");
+        if (gmailToken) {
+          try {
+            await fetch("https://oauth2.googleapis.com/revoke?token=" + encodeURIComponent(gmailToken), {
+              method: "POST",
+              headers: { "content-type": "application/x-www-form-urlencoded" },
+            });
+          } catch (_) {}
+        }
+        await clearToken();
+        sendResponse({ ok: true });
       } else if (req.type === "GMAIL_STATUS") {
         try {
           const token = await getToken(false);
           const profile = await gmailFetch("profile", token);
+          await chrome.storage.local.set({ gmailEmail: profile.emailAddress });
           sendResponse({ ok: true, email: profile.emailAddress });
         } catch {
-          sendResponse({ ok: false });
+          // Report the last-known account even when disconnected, so the popup
+          // can offer to reconnect it by name.
+          const { gmailEmail } = await chrome.storage.local.get("gmailEmail");
+          sendResponse({ ok: false, email: gmailEmail || null });
         }
       } else if (req.type === "RECORD_ATTACHED") {
         const { usedIds = [] } = await chrome.storage.local.get("usedIds");
@@ -505,7 +663,7 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
         await chrome.storage.local.set({ usedIds: usedIds.slice(-200) });
         sendResponse({ ok: true });
       } else if (req.type === "FETCH_FILE") {
-        const token = await getToken(false).catch(() => getToken(true));
+        const token = await getToken(false);
         const msg = await gmailFetch(`messages/${req.messageId}?format=full`, token);
         const parts = walkParts(msg.payload, { text: "", html: "", attachments: [] });
         const file = await getReceiptFile(token, msg, parts.html || parts.text);

@@ -48,6 +48,7 @@ function findByText(re, root = document, tag = "*") {
 // --------------------------------------------------------------- panel ------
 let panel;
 let busy = false; // true while a find/attach flow is mid-flight
+let verifying = false; // true while the passive post-attach verification watch runs
 let lastToast = "";
 let checkingStreak = 0; // canary: consecutive scans that recognized nothing
 function ensurePanel() {
@@ -285,21 +286,39 @@ async function writeMemo(memo) {
   if (save) save.click();
 }
 
-/** Narrate Ramp's own verification pipeline after we attach. */
+/**
+ * Narrate Ramp's own verification pipeline after we attach. Runs passively
+ * (fire-and-forget, with busy already released) so a real navigation can refresh
+ * the panel instead of freezing it on this card. The `verifying` guard keeps
+ * same-page background scans from clobbering this narration; a path change makes
+ * it bail so it never narrates onto a page the user has already moved on to.
+ */
 async function watchVerification() {
-  toast("Attached ✓ Ramp is verifying your receipt ⏳ (takes ~a minute)", "or-ok");
-  for (let i = 0; i < 40; i++) {
-    await new Promise((r) => setTimeout(r, 3000));
-    if (/Auto-verified/i.test(document.body.textContent)) {
-      toast('Auto-verified by Ramp 🎉<div class="or-linkrow"><a href="#" id="or-back">← Back to expenses</a></div>', "or-ok");
-      bindBack();
-      collapseSoon(10000);
-      return;
+  verifying = true;
+  const startPath = location.pathname;
+  try {
+    toast("Attached ✓ Ramp is verifying your receipt ⏳ (takes ~a minute)", "or-ok");
+    for (let i = 0; i < 40; i++) {
+      await new Promise((r) => setTimeout(r, 3000));
+      if (!alive()) return;
+      // User navigated away → this watch belongs to the old page. Stop here; the
+      // SPA-nav watcher has already re-rendered the new page (busy was released).
+      if (location.pathname !== startPath) return;
+      if (/Auto-verified/i.test(document.body.textContent)) {
+        toast('Auto-verified by Ramp 🎉<div class="or-linkrow"><a href="#" id="or-back">← Back to expenses</a></div>', "or-ok");
+        bindBack();
+        collapseSoon(10000);
+        return;
+      }
     }
+    toast('Receipt attached ✓ Ramp is still verifying.<div class="or-linkrow"><a href="#" id="or-back">← Back to expenses</a></div>', "or-ok");
+    bindBack();
+    collapseSoon(10000);
+  } finally {
+    // Always drop the guard so background scans resume once the watch ends
+    // (success, timeout, or bail-on-navigation).
+    verifying = false;
   }
-  toast('Receipt attached ✓ Ramp is still verifying.<div class="or-linkrow"><a href="#" id="or-back">← Back to expenses</a></div>', "or-ok");
-  bindBack();
-  collapseSoon(10000);
 }
 
 // ----------------------------------------------------------------- flow -----
@@ -327,8 +346,13 @@ async function runFindFlow(state) {
   });
   if (!res?.ok) {
     busy = false;
+    // Name the searched inbox so a miss reads as "not in THIS account" — Koby
+    // (and others) keep receipts across 2-3 Gmail accounts. Switch via the icon.
+    const where = res?.account
+      ? `<div class="or-dim">Searched ${esc(res.account)} — receipt in another inbox? Switch accounts from the One Ramp icon.</div>`
+      : "";
     toast(
-      `${esc(res?.error || "Search failed.")}<br><button class="or-btn" id="or-retry">Retry</button>`,
+      `${esc(res?.error || "Search failed.")}${where}<br><button class="or-btn" id="or-retry">Retry</button>`,
       "or-warn"
     );
     $("#or-retry").onclick = () => runFindFlow(state);
@@ -390,6 +414,7 @@ function showMatchCard(state, match, confident, alternates) {
   });
   $("#or-attach", body).onclick = async () => {
     busy = true;
+    let attached = false;
     try {
       // Guard against writing to the wrong charge: if the user navigated to a
       // different expense while this card sat open, the visible page no longer
@@ -403,16 +428,22 @@ function showMatchCard(state, match, confident, alternates) {
       toast("Attaching…");
       if (!state.hasReceipt && match.file?.dataB64) await attachReceipt(match.file);
       if (!state.hasMemo) await writeMemo(memoValue);
+      attached = true;
       try {
         chrome.runtime.sendMessage({ type: "RECORD_ATTACHED", messageId: match.id });
         chrome.runtime.sendMessage({ type: "BADGE_ADJUST", delta: -1 }); // one fewer outstanding
       } catch (_) {}
-      await watchVerification();
     } catch (e) {
       toast(`Partial attach: ${esc(e.message)}`, "or-warn");
     } finally {
+      // Release the lock BEFORE the passive verification watch: the writes are
+      // done, so navigating away can refresh the panel instead of it freezing on
+      // this card until a manual reload (the original bug). watchVerification()
+      // raises its own `verifying` guard, so same-page scans still won't clobber it.
       busy = false;
     }
+    // Fire-and-forget: the watch only reads Ramp's status; it must not hold busy.
+    if (attached) watchVerification().catch((e) => log("verify watch:", String((e && e.message) || e)));
   };
   // The card is now the resting state; release busy so a real page navigation
   // can refresh it. flowActive() still protects it via the #or-attach check,
@@ -530,6 +561,7 @@ setInterval(() => {
 // Never clobber a flow the user is in the middle of.
 const flowActive = () =>
   busy ||
+  verifying ||
   (panel &&
     ($("#or-attach", panel) ||
       $("#or-retry", panel) ||

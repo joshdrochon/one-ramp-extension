@@ -1,0 +1,9 @@
+{
+  "name": "one-ramp-extension",
+  "version": "0.2.0",
+  "private": true,
+  "description": "One Ramp — Chrome extension for Ramp receipt verification. (package.json is for running the dev test suite only; Chrome ignores it.)",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}

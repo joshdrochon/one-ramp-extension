@@ -2,12 +2,13 @@
   "manifest_version": 3,
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApvRqwFaQoCPqZOEcvS5ZOokj5Cj6eGozU7fmF+M1myQX7KcCyaVl3AsZ+zT4wQ5VDFdVwopLaCzKO6PZKMbYUKcKir2FT4aA3RfdzRJgtyaWEMZJgfljBTyqyZLbHUUeWKYaE+wNWGf/8YraMVkrL0XJ5NtgZrUwbSBUEzuCZ1hkmhqCw+A54I6dSpXn5eBPMBM0R8uqVXSV5OA7NsuScNS8FJx4f0DQr5SLq8lKmP+T8G5uzknifu+QeG6EOIPj1AZWr+cltYg788lx5v5Q6M9iBKTnVZj3f4nX4upazZRFvfYxA3H8fJej6JeEE3G2l0tqh5HiVje8pfX0xrsY5QIDAQAB",
   "name": "One Ramp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Verify Ramp expenses in one click: finds the matching receipt email in your Gmail and attaches receipt + memo to unverified charges.",
   "permissions": ["identity", "storage"],
   "host_permissions": [
     "https://api.ramp.com/*",
     "https://gmail.googleapis.com/*",
+    "https://oauth2.googleapis.com/*",
     "https://www.googleapis.com/*",
     "https://*.stripe.com/*",
     "https://api.anthropic.com/*"
